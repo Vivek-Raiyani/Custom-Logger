@@ -407,6 +407,7 @@ async def query_logs(
     project_id: str = Query(...),
     level: str | None = Query(None),
     service_label: str | None = Query(None),
+    request_id: str | None = Query(None),
     error_code: str | None = Query(None),
     limit: int = Query(100, le=500),
     offset: int = Query(0),
@@ -435,6 +436,8 @@ async def query_logs(
         q = q.where(LogEntry.service_label == service_label)
     if error_code:
         q = q.where(LogEntry.error_code == error_code)
+    if request_id:
+        q = q.where(LogEntry.request_id == request_id)
 
     q = q.order_by(LogEntry.ts.desc()).limit(limit).offset(offset)
 
