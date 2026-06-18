@@ -1,10 +1,10 @@
-"""Authentication endpoints: register + login."""
+"""Authentication endpoints: register + login + me."""
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from app.core.deps import DB
+from app.core.deps import CurrentUser, DB
 from app.core.security import create_access_token, hash_password, verify_password
 from app.database.models import SubscriptionPlan, User, UserSubscription
 
@@ -14,6 +14,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
+
 
 class RegisterRequest(BaseModel):
     email: EmailStr
@@ -34,6 +35,8 @@ class UserOut(BaseModel):
     id: str
     email: str
     plan: str | None = None
+    plan_display_name: str | None = None
+    max_projects: int | None = None
 
     model_config = {"from_attributes": True}
 
@@ -48,9 +51,9 @@ class RegisterResponse(BaseModel):
 # Routes
 # ---------------------------------------------------------------------------
 
+
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 async def register(body: RegisterRequest, db: DB) -> RegisterResponse:
-    # Check email uniqueness
     existing = await db.execute(select(User).where(User.email == body.email))
     if existing.scalar_one_or_none():
         raise HTTPException(
@@ -58,9 +61,11 @@ async def register(body: RegisterRequest, db: DB) -> RegisterResponse:
             detail="An account with this email already exists",
         )
 
-    # Resolve the free plan
     plan_result = await db.execute(
-        select(SubscriptionPlan).where(SubscriptionPlan.name == "free", SubscriptionPlan.is_active == True)  # noqa: E712
+        select(SubscriptionPlan).where(
+            SubscriptionPlan.name == "free",
+            SubscriptionPlan.is_active == True,  # noqa: E712
+        )
     )
     free_plan = plan_result.scalar_one_or_none()
     if free_plan is None:
@@ -69,13 +74,9 @@ async def register(body: RegisterRequest, db: DB) -> RegisterResponse:
             detail="Subscription plans not seeded. Run startup.",
         )
 
-    # Create user + subscription in one transaction
-    user = User(
-        email=body.email,
-        hashed_password=hash_password(body.password),
-    )
+    user = User(email=body.email, hashed_password=hash_password(body.password))
     db.add(user)
-    await db.flush()  # get user.id without committing
+    await db.flush()
 
     subscription = UserSubscription(user_id=user.id, plan_id=free_plan.id)
     db.add(subscription)
@@ -84,7 +85,13 @@ async def register(body: RegisterRequest, db: DB) -> RegisterResponse:
 
     token = create_access_token(subject=user.id)
     return RegisterResponse(
-        user=UserOut(id=user.id, email=user.email, plan=free_plan.name),
+        user=UserOut(
+            id=user.id,
+            email=user.email,
+            plan=free_plan.name,
+            plan_display_name=free_plan.display_name,
+            max_projects=free_plan.max_projects,
+        ),
         access_token=token,
     )
 
@@ -108,11 +115,16 @@ async def login(body: LoginRequest, db: DB) -> TokenResponse:
     return TokenResponse(access_token=token)
 
 
-# @router.get("/me", response_model=UserOut)
-# async def me(db: DB, current_user: User = None) -> UserOut:
-#     """Return the authenticated user's profile."""
-#     # Import here to avoid circular — deps imports models, not routers
-#     from app.core.deps import get_current_user  # noqa: F401 (used via Depends in practice)
+@router.get("/me", response_model=UserOut)
+async def me(current_user: CurrentUser) -> UserOut:
+    """Return the authenticated user's profile and plan info."""
+    sub = current_user.subscription
+    plan = sub.plan if sub else None
 
-#     # This route is wired with the dependency in main.py instead
-#     raise HTTPException(status_code=501, detail="Use the dependency-injected version")
+    return UserOut(
+        id=current_user.id,
+        email=current_user.email,
+        plan=plan.name if plan else None,
+        plan_display_name=plan.display_name if plan else None,
+        max_projects=plan.max_projects if plan else None,
+    )

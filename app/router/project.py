@@ -6,17 +6,23 @@ The number of active projects a user may own is capped by
 ``subscription_plans.max_projects``.  A value of ``-1`` means unlimited.
 The limit is read from the DB, so changing a plan's cap takes effect
 immediately without any code change.
+
+API key
+-------
+The raw key is returned ONLY at creation time (POST /projects).
+After that, only the prefix (first 16 chars) is visible, and the user
+can rotate the key via POST /projects/{id}/rotate-api-key.
 """
 import re
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
 
 from app.core.deps import CurrentUser, DB
-from app.database.models import Project, UserSubscription
-
 from app.core.security import generate_api_key
+from app.database.models import Project, UserSubscription
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -24,6 +30,7 @@ router = APIRouter(prefix="/projects", tags=["projects"])
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
+
 
 class ProjectCreate(BaseModel):
     name: str
@@ -48,6 +55,7 @@ class ProjectOut(BaseModel):
     name: str
     slug: str
     description: str | None
+    api_key_prefix: str
     is_active: bool
     created_at: str
 
@@ -60,14 +68,26 @@ class ProjectOut(BaseModel):
             name=p.name,
             slug=p.slug,
             description=p.description,
+            api_key_prefix=p.api_key_prefix,
             is_active=p.is_active,
             created_at=p.created_at.isoformat(),
         )
 
 
+class ProjectCreatedOut(ProjectOut):
+    """Returned only on creation — includes the raw API key (shown once)."""
+    api_key: str
+
+
+class ApiKeyRotatedOut(BaseModel):
+    api_key: str
+    api_key_prefix: str
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _slugify(text: str) -> str:
     text = text.lower().strip()
@@ -87,32 +107,40 @@ async def _active_project_count(db, owner_id: str) -> int:
 
 
 async def _get_max_projects(db, user_id: str) -> int:
-    """Return the max_projects limit for the user's active plan."""
+    """Return the max_projects limit for the user's active plan (single query)."""
     result = await db.execute(
-        select(UserSubscription)
-        .where(UserSubscription.user_id == user_id)
-    )
-    sub = result.scalar_one_or_none()
-    if sub is None:
-        return 1  # no subscription row → apply most restrictive default
-
-    # Lazy-load plan inline
-    from sqlalchemy.orm import selectinload
-    result2 = await db.execute(
         select(UserSubscription)
         .where(UserSubscription.user_id == user_id)
         .options(selectinload(UserSubscription.plan))
     )
-    sub = result2.scalar_one_or_none()
-    return sub.plan.max_projects if sub and sub.plan else 1
+    sub = result.scalar_one_or_none()
+    if sub is None or sub.plan is None:
+        return 1
+    return sub.plan.max_projects
+
+
+async def _ensure_unique_slug(db, owner_id: str, base_slug: str) -> str:
+    slug = base_slug
+    suffix = 1
+    while True:
+        existing = await db.execute(
+            select(Project).where(Project.owner_id == owner_id, Project.slug == slug)
+        )
+        if existing.scalar_one_or_none() is None:
+            return slug
+        slug = f"{base_slug}-{suffix}"
+        suffix += 1
 
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
-@router.post("", response_model=ProjectOut, status_code=status.HTTP_201_CREATED)
-async def create_project(body: ProjectCreate, current_user: CurrentUser, db: DB) -> ProjectOut:
+
+@router.post("", response_model=ProjectCreatedOut, status_code=status.HTTP_201_CREATED)
+async def create_project(
+    body: ProjectCreate, current_user: CurrentUser, db: DB
+) -> ProjectCreatedOut:
     max_projects = await _get_max_projects(db, current_user.id)
     current_count = await _active_project_count(db, current_user.id)
 
@@ -124,22 +152,10 @@ async def create_project(body: ProjectCreate, current_user: CurrentUser, db: DB)
                 "Upgrade your plan to create more."
             ),
         )
-    
+
     raw_key, key_hash = generate_api_key()
-
     base_slug = _slugify(body.name)
-
-    # Ensure slug uniqueness per user
-    slug = base_slug
-    suffix = 1
-    while True:
-        existing = await db.execute(
-            select(Project).where(Project.owner_id == current_user.id, Project.slug == slug)
-        )
-        if existing.scalar_one_or_none() is None:
-            break
-        slug = f"{base_slug}-{suffix}"
-        suffix += 1
+    slug = await _ensure_unique_slug(db, current_user.id, base_slug)
 
     project = Project(
         owner_id=current_user.id,
@@ -153,12 +169,16 @@ async def create_project(body: ProjectCreate, current_user: CurrentUser, db: DB)
     await db.commit()
     await db.refresh(project)
 
-    print("-"*50)
-    print("Need endpoint to get the apikey")
-    print("raw_key: ", raw_key) 
-    print("-"*50)
-
-    return ProjectOut.from_orm_project(project)
+    return ProjectCreatedOut(
+        id=project.id,
+        name=project.name,
+        slug=project.slug,
+        description=project.description,
+        api_key_prefix=project.api_key_prefix,
+        is_active=project.is_active,
+        created_at=project.created_at.isoformat(),
+        api_key=raw_key,  # shown once only
+    )
 
 
 @router.get("", response_model=list[ProjectOut])
@@ -195,7 +215,7 @@ async def update_project(
 
     if body.name is not None:
         project.name = body.name.strip()
-        project.slug = _slugify(body.name)
+        project.slug = await _ensure_unique_slug(db, current_user.id, _slugify(body.name))
     if body.description is not None:
         project.description = body.description
 
@@ -213,5 +233,31 @@ async def delete_project(project_id: str, current_user: CurrentUser, db: DB) -> 
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
 
-    project.is_active = False  # soft delete
+    project.is_active = False
     await db.commit()
+
+
+@router.post("/{project_id}/rotate-api-key", response_model=ApiKeyRotatedOut)
+async def rotate_api_key(project_id: str, current_user: CurrentUser, db: DB) -> ApiKeyRotatedOut:
+    """
+    Generate a new API key for the project and invalidate the old one.
+    The new raw key is returned once — store it immediately.
+    """
+    result = await db.execute(
+        select(Project).where(
+            Project.id == project_id,
+            Project.owner_id == current_user.id,
+            Project.is_active.is_(True),
+        )
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
+    raw_key, key_hash = generate_api_key()
+    project.api_key_hash = key_hash
+    project.api_key_prefix = raw_key[:16]
+
+    await db.commit()
+
+    return ApiKeyRotatedOut(api_key=raw_key, api_key_prefix=raw_key[:16])

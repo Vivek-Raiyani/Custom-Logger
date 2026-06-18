@@ -6,6 +6,9 @@ subscription_plans   – catalogue of plans (free / pro / enterprise …)
 users                – registered accounts
 user_subscriptions   – which plan a user is on (one active row per user)
 projects             – projects owned by a user
+log_entries          – structured log entries ingested from SDK
+alert_rules          – user-configured alert rules per project
+alert_events         – fired alert history (used for cooldown dedup)
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ from sqlalchemy import (
     Float,
     JSON,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -43,17 +47,12 @@ class Base(DeclarativeBase):
 # ---------------------------------------------------------------------------
 
 class SubscriptionPlan(Base):
-    """Catalogue entry for a subscription tier.
-
-    ``features`` is a free-form JSON object so you can add flags (e.g.
-    ``{"alerts": true, "log_retention_days": 30}``) without schema changes.
-    ``max_projects`` of -1 means unlimited.
-    """
+    """Catalogue entry for a subscription tier."""
 
     __tablename__ = "subscription_plans"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
-    name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)  # "free", "pro", …
+    name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     price: Mapped[float] = mapped_column(Float, nullable=False)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
     max_projects: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -98,11 +97,7 @@ class User(Base):
 # ---------------------------------------------------------------------------
 
 class UserSubscription(Base):
-    """Tracks which plan a user is currently on.
-
-    Only one row per user is expected (enforced by the unique constraint on
-    ``user_id``).  When upgrading/downgrading, UPDATE the existing row.
-    """
+    """Tracks which plan a user is currently on."""
 
     __tablename__ = "user_subscriptions"
     __table_args__ = (UniqueConstraint("user_id", name="uq_user_subscription"),)
@@ -114,7 +109,6 @@ class UserSubscription(Base):
     plan_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("subscription_plans.id"), nullable=False
     )
-    # ISO 8601 date strings are fine; use None for "no expiry" (lifetime / manual)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -131,70 +125,162 @@ class UserSubscription(Base):
 class Project(Base):
     __tablename__ = "projects"
 
-    id: Mapped[str] = mapped_column(
-        String(36),
-        primary_key=True,
-        default=_new_uuid,
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    slug: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    api_key_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    api_key_prefix: Mapped[str] = mapped_column(String(16), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
-    owner_id: Mapped[str] = mapped_column(
-        String(36),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
+    __table_args__ = (
+        UniqueConstraint("owner_id", "slug", name="uq_project_owner_slug"),
+    )
+
+    owner: Mapped[User] = relationship(back_populates="projects")
+    log_entries: Mapped[list[LogEntry]] = relationship(back_populates="project")
+    alert_rules: Mapped[list[AlertRule]] = relationship(back_populates="project")
+
+
+# ---------------------------------------------------------------------------
+# Log entries  (persisted from SDK ingest)
+# ---------------------------------------------------------------------------
+
+class LogEntry(Base):
+    """
+    One log line ingested from the SDK.
+
+    ``service_label`` — the logical service name the SDK caller sets
+                        (e.g. "payment-service", "auth-service").
+    ``error_code``    — optional machine-readable code the SDK caller sets
+                        (e.g. "ERR_PAYMENT_API", "ERR_DB_CONN").
+    ``fingerprint``   — short hash used for alert dedup bucketing.
+                        Computed as sha256(project_id:service_label:level:error_code_or_message_prefix)[:16]
+    """
+
+    __tablename__ = "log_entries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    # Core log fields
+    ts: Mapped[float] = mapped_column(Float, nullable=False, index=True)
+    level: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # SDK-provided context for alert matching
+    service_label: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+
+    # Optional SDK fields
+    module: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    function: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    extra: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    # Dedup / alert bucketing key — indexed for fast window COUNT queries
+    fingerprint: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    project: Mapped[Project] = relationship(back_populates="log_entries")
+
+
+# ---------------------------------------------------------------------------
+# Alert rules
+# ---------------------------------------------------------------------------
+
+class AlertRule(Base):
+    """
+    A user-configured rule that fires an email when a matching log pattern
+    exceeds ``threshold`` occurrences within ``window_seconds``.
+
+    Match logic
+    -----------
+    ``match_field`` picks which log field to inspect:
+        "level"      → log.level == match_value   (e.g. "error")
+        "error_code" → log.error_code == match_value  (exact)
+        "message"    → match_value in log.message  (substring)
+
+    ``service_label`` scopes the rule to a specific service.
+    If None the rule applies to all services in the project.
+
+    Cooldown
+    --------
+    After an alert fires, it will not re-fire until ``window_seconds``
+    have passed (one alert per window per rule).
+    """
+
+    __tablename__ = "alert_rules"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
     )
 
     name: Mapped[str] = mapped_column(String(256), nullable=False)
 
-    description: Mapped[str | None] = mapped_column(
-        String(1024),
-        nullable=True,
-    )
+    # Scope — if None → match all services in the project
+    service_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    slug: Mapped[str] = mapped_column(
-        String(256),
-        nullable=False,
-        index=True,
-    )
+    # What to match
+    match_field: Mapped[str] = mapped_column(String(32), nullable=False)   # "level" | "error_code" | "message"
+    match_value: Mapped[str] = mapped_column(String(256), nullable=False)
 
-    api_key_hash: Mapped[str] = mapped_column(
-        String(64),
-        nullable=False,
-        unique=True,
-        index=True,
-    )
+    # Thresholds
+    threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    window_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)
 
-    api_key_prefix: Mapped[str] = mapped_column(
-        String(16),
-        nullable=False,
-    )
+    # Where to send the alert
+    notify_email: Mapped[str] = mapped_column(String(320), nullable=False)
 
-    is_active: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=True,
-    )
-
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        default=_utcnow,
+        DateTime(timezone=True), nullable=False, default=_utcnow
     )
-
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        default=_utcnow,
-        onupdate=_utcnow,
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
-    __table_args__ = (
-        UniqueConstraint(
-            "owner_id",
-            "slug",
-            name="uq_project_owner_slug",
-        ),
+    project: Mapped[Project] = relationship(back_populates="alert_rules")
+    alert_events: Mapped[list[AlertEvent]] = relationship(back_populates="rule")
+
+
+# ---------------------------------------------------------------------------
+# Alert events  (fired alert history — used for cooldown)
+# ---------------------------------------------------------------------------
+
+class AlertEvent(Base):
+    """
+    Records every time an alert rule fires.
+    Used to enforce the one-alert-per-window cooldown:
+    before firing, we check if any AlertEvent for the same rule exists
+    within the last window_seconds.
+    """
+
+    __tablename__ = "alert_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    rule_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("alert_rules.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    fingerprint: Mapped[str] = mapped_column(String(16), nullable=False)
+    occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    fired_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, index=True
     )
 
-    owner: Mapped["User"] = relationship(
-        back_populates="projects"
-    )
+    rule: Mapped[AlertRule] = relationship(back_populates="alert_events")
