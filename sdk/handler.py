@@ -1,55 +1,42 @@
 """
 Lycan SDK — synchronous log handler.
 
-Setup (once, at app startup / middleware level)
------------------------------------------------
+Mode 1: Standalone (manual service naming)
+------------------------------------------
     import logging
     from lycan import RemoteLogHandler
 
     handler = RemoteLogHandler(api_key="sk_...")
     logging.root.addHandler(handler)
 
-That's it. Every logger in the process is now captured automatically.
+    payment_log = logging.getLogger("payment")
+    payment_log.error("Gateway rejected", extra={"error_code": "ERR_PAYMENT_API"})
 
-Service identification
-----------------------
-service_label is derived from record.name — the name passed to
-logging.getLogger(). So each service just names its logger correctly
-and the handler takes care of the rest. No per-service config needed.
+Mode 2: Plug-and-play with LycanMiddleware (route-based)
+---------------------------------------------------------
+    from lycan import RemoteLogHandler, LycanMiddleware
 
-    # payment/service.py
-    logger = logging.getLogger("payment")
-    logger.error("Gateway rejected", extra={"error_code": "ERR_PAYMENT_API"})
-    #  → service_label = "payment", error_code = "ERR_PAYMENT_API"
+    logging.root.addHandler(RemoteLogHandler(api_key="sk_..."))
 
-    # auth/service.py
-    logger = logging.getLogger("auth")
-    logger.error("Token expired", extra={"error_code": "ERR_TOKEN_EXPIRED"})
-    #  → service_label = "auth", error_code = "ERR_TOKEN_EXPIRED"
+    app.add_middleware(LycanMiddleware, api_key="sk_...", services={
+        "/payment": "payment",
+        "/auth":    "auth",
+    })
 
-    # db/pool.py
-    logger = logging.getLogger("db")
-    logger.error("Connection pool exhausted", extra={"error_code": "ERR_DB_CONN"})
-    #  → service_label = "db", error_code = "ERR_DB_CONN"
+    # Any logger used during a /payment/* request is automatically tagged:
+    #   service_label = "payment"
+    #   request_id    = "<uuid>"   ← same for every log in that request
 
-For dotted logger names (e.g. "app.routers.payment") the full name is
-sent as-is so alert rules can match as broadly or narrowly as needed.
-e.g. match service_label = "app.routers.payment" for a specific router,
-or use a message/error_code rule to catch across all services.
-
-Alert matching via error_code
-------------------------------
-Pass error_code in the extra dict — standard Python logging pattern:
-
-    logger.error("msg", extra={"error_code": "ERR_X"})
-
-Two logs with different error_codes always produce different fingerprints,
-so "payment API failure" and "payment DB failure" are never conflated
-even if both come from the same logger.
+Resolution order in emit()
+---------------------------
+  service_label → ContextVar (middleware) → record.name (standalone)
+  request_id    → ContextVar (middleware) → record.request_id attr (manual)
 """
 
 import logging
 import requests
+
+from lycan.context import get_request_id, get_service_label
 
 
 class RemoteLogHandler(logging.Handler):
@@ -71,20 +58,23 @@ class RemoteLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # service_label: middleware ContextVar → logger name fallback
+            service_label = get_service_label() or record.name
+
+            # request_id: middleware ContextVar → manual extra attr fallback
+            request_id = get_request_id() or getattr(record, "request_id", None)
+
             payload = {
                 "entries": [
                     {
                         "level": record.levelname.lower(),
                         "message": record.getMessage(),
                         "timestamp": record.created,
-                        # record.name is the logger name — "payment", "auth", "db", etc.
-                        # For dotted names like "app.routers.payment", the full name is sent.
-                        "service_label": record.name,
-                        # Set via: logger.error("msg", extra={"error_code": "ERR_X"})
+                        "service_label": service_label,
+                        "request_id": request_id,
                         "error_code": getattr(record, "error_code", None),
                         "module": record.module,
                         "function": record.funcName,
-                        "request_id": getattr(record, "request_id", None),
                         "extra": {},
                     }
                 ]
