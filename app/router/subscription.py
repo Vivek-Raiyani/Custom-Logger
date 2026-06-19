@@ -8,6 +8,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.deps import CurrentUser, DB
 from app.database.models import SubscriptionPlan, UserSubscription
+from app.services.pendo import track as pendo_track
 
 router = APIRouter(prefix="/subscription", tags=["subscription"])
 
@@ -124,12 +125,26 @@ async def upgrade_subscription(
             detail=f"You are already on the '{new_plan.display_name}' plan.",
         )
 
+    previous_plan_name = sub.plan.name if sub.plan else None
+
     # Swap the plan
     sub.plan_id = new_plan.id
     # expires_at intentionally left as-is — payment layer will manage this later
 
     await db.commit()
     await db.refresh(sub)
+
+    await pendo_track(
+        "subscription_changed",
+        visitor_id=current_user.id,
+        account_id=current_user.id,
+        properties={
+            "previous_plan_name": previous_plan_name,
+            "new_plan_name": new_plan.name,
+            "new_plan_price": new_plan.price,
+            "new_max_projects": new_plan.max_projects,
+        },
+    )
 
     return SubscriptionOut(
         plan_name=new_plan.name,

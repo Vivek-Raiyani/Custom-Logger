@@ -32,6 +32,7 @@ from app.core.config import get_settings
 from app.core.deps import CurrentUser, DB
 from app.database.db import get_db
 from app.database.models import AlertEvent, AlertRule, LogEntry, Project
+from app.services.pendo import track as pendo_track
 
 router = APIRouter(prefix="/logs", tags=["logs"])
 
@@ -247,6 +248,24 @@ async def _check_and_fire_alerts(
         )
         db.add(event)
 
+        await pendo_track(
+            "alert_fired",
+            visitor_id="system",
+            account_id=project_id,
+            properties={
+                "rule_id": str(rule.id),
+                "rule_name": rule.name,
+                "project_id": project_id,
+                "service_label": entry.service_label,
+                "match_field": rule.match_field,
+                "match_value": rule.match_value,
+                "occurrence_count": count,
+                "threshold": rule.threshold,
+                "window_seconds": rule.window_seconds,
+                "fingerprint": fingerprint,
+            },
+        )
+
     await db.commit()
 
 
@@ -397,6 +416,25 @@ async def ingest_logs(
             fingerprint=orm_entry.fingerprint,
         )
 
+    log_levels = list({e.level for e in body.entries})
+    service_labels = list({e.service_label for e in body.entries if e.service_label})
+    error_count = sum(1 for e in body.entries if e.error_code)
+
+    await pendo_track(
+        "logs_batch_ingested",
+        visitor_id="system",
+        account_id=str(project.id),
+        properties={
+            "project_id": str(project.id),
+            "project_name": project.name,
+            "batch_size": len(body.entries),
+            "log_levels": ",".join(log_levels),
+            "distinct_service_labels": ",".join(service_labels),
+            "has_error_codes": error_count > 0,
+            "error_entry_count": error_count,
+        },
+    )
+
     return LogResponse(accepted=len(body.entries))
 
 
@@ -443,6 +481,22 @@ async def query_logs(
 
     result = await db.execute(q)
     entries = result.scalars().all()
+
+    await pendo_track(
+        "logs_queried",
+        visitor_id=current_user.id,
+        account_id=current_user.id,
+        properties={
+            "project_id": project_id,
+            "level_filter": level,
+            "service_label_filter": service_label,
+            "error_code_filter": error_code,
+            "request_id_filter": request_id,
+            "limit": limit,
+            "offset": offset,
+            "results_count": len(entries),
+        },
+    )
 
     return [
         LogEntryOut(
