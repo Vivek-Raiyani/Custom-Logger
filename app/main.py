@@ -1,8 +1,10 @@
 import asyncio
 from contextlib import asynccontextmanager
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from app.core.config import get_settings
 from app.database.db import create_all, AsyncSessionLocal, seed_plans
@@ -49,3 +51,5 @@ app.include_router(authrouter)
 app.include_router(projectrouter)
 app.include_router(logrouter)
 app.include_router(alertrouter)
+
+app.mount("/", StaticFiles(directory=Path(__file__).resolve().parent.parent / "public", html=True), name="static")
