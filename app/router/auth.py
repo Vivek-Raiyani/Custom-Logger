@@ -7,6 +7,7 @@ from sqlalchemy.orm import selectinload
 from app.core.deps import CurrentUser, DB
 from app.core.security import create_access_token, hash_password, verify_password
 from app.database.models import SubscriptionPlan, User, UserSubscription
+from app.services.pendo import track as pendo_track
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -84,6 +85,18 @@ async def register(body: RegisterRequest, db: DB) -> RegisterResponse:
     await db.refresh(user)
 
     token = create_access_token(subject=user.id)
+
+    await pendo_track(
+        "user_registered",
+        visitor_id=user.id,
+        account_id=user.id,
+        properties={
+            "plan_name": free_plan.name,
+            "plan_display_name": free_plan.display_name,
+            "max_projects": free_plan.max_projects,
+        },
+    )
+
     return RegisterResponse(
         user=UserOut(
             id=user.id,
@@ -112,6 +125,13 @@ async def login(body: LoginRequest, db: DB) -> TokenResponse:
         )
 
     token = create_access_token(subject=user.id)
+
+    await pendo_track(
+        "user_logged_in",
+        visitor_id=user.id,
+        account_id=user.id,
+    )
+
     return TokenResponse(access_token=token)
 
 

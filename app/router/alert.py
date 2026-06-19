@@ -15,6 +15,7 @@ from sqlalchemy import select
 
 from app.core.deps import CurrentUser, DB
 from app.database.models import AlertEvent, AlertRule, Project
+from app.services.pendo import track as pendo_track
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
 
@@ -194,6 +195,23 @@ async def create_alert_rule(
     db.add(rule)
     await db.commit()
     await db.refresh(rule)
+
+    await pendo_track(
+        "alert_rule_created",
+        visitor_id=current_user.id,
+        account_id=current_user.id,
+        properties={
+            "rule_id": rule.id,
+            "project_id": rule.project_id,
+            "match_field": rule.match_field,
+            "match_value": rule.match_value,
+            "threshold": rule.threshold,
+            "window_seconds": rule.window_seconds,
+            "has_service_scope": rule.service_label is not None,
+            "service_label": rule.service_label,
+        },
+    )
+
     return AlertRuleOut.from_orm(rule)
 
 
@@ -231,33 +249,73 @@ async def update_alert_rule(
 ) -> AlertRuleOut:
     rule = await _get_rule_or_404(db, rule_id, current_user.id)
 
+    changed_fields = []
     if body.name is not None:
         rule.name = body.name
+        changed_fields.append("name")
     if body.service_label is not None:
         rule.service_label = body.service_label
+        changed_fields.append("service_label")
     if body.match_field is not None:
         rule.match_field = body.match_field
+        changed_fields.append("match_field")
     if body.match_value is not None:
         rule.match_value = body.match_value
+        changed_fields.append("match_value")
     if body.threshold is not None:
         rule.threshold = body.threshold
+        changed_fields.append("threshold")
     if body.window_seconds is not None:
         rule.window_seconds = body.window_seconds
+        changed_fields.append("window_seconds")
     if body.notify_email is not None:
         rule.notify_email = str(body.notify_email)
+        changed_fields.append("notify_email")
     if body.is_active is not None:
         rule.is_active = body.is_active
+        changed_fields.append("is_active")
 
     await db.commit()
     await db.refresh(rule)
+
+    await pendo_track(
+        "alert_rule_updated",
+        visitor_id=current_user.id,
+        account_id=current_user.id,
+        properties={
+            "rule_id": rule.id,
+            "project_id": rule.project_id,
+            "name_changed": "name" in changed_fields,
+            "match_field_changed": "match_field" in changed_fields,
+            "match_value_changed": "match_value" in changed_fields,
+            "threshold_changed": "threshold" in changed_fields,
+            "window_seconds_changed": "window_seconds" in changed_fields,
+            "notify_email_changed": "notify_email" in changed_fields,
+            "is_active_changed": "is_active" in changed_fields,
+            "fields_updated_count": len(changed_fields),
+        },
+    )
+
     return AlertRuleOut.from_orm(rule)
 
 
 @router.delete("/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_alert_rule(rule_id: str, current_user: CurrentUser, db: DB) -> None:
     rule = await _get_rule_or_404(db, rule_id, current_user.id)
+    rule_id_val = rule.id
+    project_id_val = rule.project_id
     await db.delete(rule)
     await db.commit()
+
+    await pendo_track(
+        "alert_rule_deleted",
+        visitor_id=current_user.id,
+        account_id=current_user.id,
+        properties={
+            "rule_id": rule_id_val,
+            "project_id": project_id_val,
+        },
+    )
 
 
 @router.get("/{rule_id}/events", response_model=list[AlertEventOut])

@@ -23,6 +23,7 @@ from sqlalchemy.orm import selectinload
 from app.core.deps import CurrentUser, DB
 from app.core.security import generate_api_key
 from app.database.models import Project, UserSubscription
+from app.services.pendo import track as pendo_track
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -145,6 +146,15 @@ async def create_project(
     current_count = await _active_project_count(db, current_user.id)
 
     if max_projects != -1 and current_count >= max_projects:
+        await pendo_track(
+            "project_limit_reached",
+            visitor_id=current_user.id,
+            account_id=current_user.id,
+            properties={
+                "current_project_count": current_count,
+                "max_projects": max_projects,
+            },
+        )
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail=(
@@ -168,6 +178,18 @@ async def create_project(
     db.add(project)
     await db.commit()
     await db.refresh(project)
+
+    await pendo_track(
+        "project_created",
+        visitor_id=current_user.id,
+        account_id=current_user.id,
+        properties={
+            "project_id": project.id,
+            "project_name": project.name,
+            "project_slug": project.slug,
+            "has_description": project.description is not None,
+        },
+    )
 
     return ProjectCreatedOut(
         id=project.id,
@@ -213,14 +235,29 @@ async def update_project(
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
 
-    if body.name is not None:
+    name_changed = body.name is not None
+    description_changed = body.description is not None
+
+    if name_changed:
         project.name = body.name.strip()
         project.slug = await _ensure_unique_slug(db, current_user.id, _slugify(body.name))
-    if body.description is not None:
+    if description_changed:
         project.description = body.description
 
     await db.commit()
     await db.refresh(project)
+
+    await pendo_track(
+        "project_updated",
+        visitor_id=current_user.id,
+        account_id=current_user.id,
+        properties={
+            "project_id": project.id,
+            "name_changed": name_changed,
+            "description_changed": description_changed,
+        },
+    )
+
     return ProjectOut.from_orm_project(project)
 
 
@@ -235,6 +272,15 @@ async def delete_project(project_id: str, current_user: CurrentUser, db: DB) -> 
 
     project.is_active = False
     await db.commit()
+
+    await pendo_track(
+        "project_deleted",
+        visitor_id=current_user.id,
+        account_id=current_user.id,
+        properties={
+            "project_id": project.id,
+        },
+    )
 
 
 @router.post("/{project_id}/rotate-api-key", response_model=ApiKeyRotatedOut)
@@ -259,5 +305,14 @@ async def rotate_api_key(project_id: str, current_user: CurrentUser, db: DB) -> 
     project.api_key_prefix = raw_key[:16]
 
     await db.commit()
+
+    await pendo_track(
+        "api_key_rotated",
+        visitor_id=current_user.id,
+        account_id=current_user.id,
+        properties={
+            "project_id": project.id,
+        },
+    )
 
     return ApiKeyRotatedOut(api_key=raw_key, api_key_prefix=raw_key[:16])
